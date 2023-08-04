@@ -30,7 +30,7 @@ class PurgeLogShardsCR : public RGWShardCollectCR {
 
   static constexpr int max_concurrent = 16;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }
@@ -273,7 +273,7 @@ class MetaMasterTrimShardCollectCR : public RGWShardCollectCR {
   std::string oid;
   const rgw_meta_sync_status& sync_status;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }
@@ -334,7 +334,7 @@ class MetaMasterStatusCollectCR : public RGWShardCollectCR {
   connection_map::iterator c;
   std::vector<rgw_meta_sync_status>::iterator s;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }
@@ -550,7 +550,7 @@ class MetaPeerTrimShardCollectCR : public RGWShardCollectCR {
   RGWMetaSyncEnv meta_env; //< for RGWListRemoteMDLogShardCR
   int shard_id{0};
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }

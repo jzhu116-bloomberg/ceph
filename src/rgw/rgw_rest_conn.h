@@ -67,8 +67,14 @@ inline param_vec_t make_param_list(const std::map<std::string, std::string> *pp)
 
 class RGWRESTConn
 {
+  struct conn_status {
+    bool connectable;
+    ceph::real_time last_status_update;
+  };
+
   CephContext *cct;
   std::vector<std::string> endpoints;
+  std::unordered_map<std::string, conn_status> endpoints_status;
   RGWAccessKey key;
   std::string self_zone_group;
   std::string remote_id;
@@ -99,6 +105,7 @@ public:
 
   int get_url(std::string& endpoint);
   std::string get_url();
+  void set_url_unconnectable(const std::string& endpoint);
   const std::string& get_self_zonegroup() {
     return self_zone_group;
   }
@@ -289,11 +296,13 @@ public:
 class RGWRESTReadResource : public RefCountedObject, public RGWIOProvider {
   CephContext *cct;
   RGWRESTConn *conn;
+  std::string url;
   std::string resource;
   param_vec_t params;
   std::map<std::string, std::string> headers;
   bufferlist bl;
   RGWStreamIntoBufferlist cb;
+  int req_ret;
 
   RGWHTTPManager *mgr;
   RGWRESTStreamReadRequest req;
@@ -312,7 +321,8 @@ public:
 		      param_vec_t& _params,
 		      param_vec_t *extra_headers,
 		      RGWHTTPManager *_mgr);
-  ~RGWRESTReadResource() = default;
+
+  ~RGWRESTReadResource();
 
   rgw_io_id get_io_id(int io_type) {
     return req.get_io_id(io_type);
@@ -343,6 +353,7 @@ public:
 
   int wait(bufferlist *pbl, optional_yield y) {
     int ret = req.wait(y);
+    req_ret = ret;
     if (ret < 0) {
       return ret;
     }
@@ -395,6 +406,7 @@ template <class T>
 int RGWRESTReadResource::wait(T *dest, optional_yield y)
 {
   int ret = req.wait(y);
+  req_ret = ret;
   if (ret < 0) {
     return ret;
   }
@@ -409,12 +421,14 @@ int RGWRESTReadResource::wait(T *dest, optional_yield y)
 class RGWRESTSendResource : public RefCountedObject, public RGWIOProvider {
   CephContext *cct;
   RGWRESTConn *conn;
+  std::string url;
   std::string method;
   std::string resource;
   param_vec_t params;
   std::map<std::string, std::string> headers;
   bufferlist bl;
   RGWStreamIntoBufferlist cb;
+  int req_ret;
 
   RGWHTTPManager *mgr;
   RGWRESTStreamRWRequest req;
@@ -436,7 +450,7 @@ public:
 		      param_vec_t *extra_headers,
 		      RGWHTTPManager *_mgr);
 
-  ~RGWRESTSendResource() = default;
+  ~RGWRESTSendResource();
 
   rgw_io_id get_io_id(int io_type) {
     return req.get_io_id(io_type);
@@ -466,6 +480,7 @@ public:
   int wait(bufferlist *pbl, optional_yield y, E *err_result = nullptr) {
     int ret = req.wait(y);
     *pbl = bl;
+    req_ret = ret;
 
     if (ret < 0 && err_result ) {
       ret = parse_decode_json(*err_result, bl);
@@ -482,6 +497,7 @@ template <class T, class E>
 int RGWRESTSendResource::wait(T *dest, optional_yield y, E *err_result)
 {
   int ret = req.wait(y);
+  req_ret = ret;
   if (ret >= 0) {
     ret = req.get_status();
   }

@@ -523,7 +523,7 @@ class RGWShardCollectCR : public RGWCoroutine {
   // returning 0. if handle_result() returns a negative value, it's
   // treated as an error and stored in 'status'. the last such error is
   // reported to the caller with set_cr_error()
-  virtual int handle_result(int r) = 0;
+  virtual int handle_result(int r, void *data = nullptr) = 0;
  public:
   RGWShardCollectCR(CephContext *_cct, int _max_concurrent)
     : RGWCoroutine(_cct), max_concurrent(_max_concurrent)

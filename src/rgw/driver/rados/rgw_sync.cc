@@ -148,9 +148,10 @@ int RGWShardCollectCR::operate(const DoutPrefixProvider *dpp) {
       if (current_running >= max_concurrent) {
         int child_ret;
         yield wait_for_child();
-        if (collect_next(&child_ret)) {
+        RGWCoroutinesStack *child;
+        if (collect_next(&child_ret, &child)) {
           current_running--;
-          child_ret = handle_result(child_ret);
+          child_ret = handle_result(child_ret, (void*)child);
           if (child_ret < 0) {
             status = child_ret;
           }
@@ -160,9 +161,10 @@ int RGWShardCollectCR::operate(const DoutPrefixProvider *dpp) {
     while (current_running > 0) {
       int child_ret;
       yield wait_for_child();
-      if (collect_next(&child_ret)) {
+      RGWCoroutinesStack *child;
+      if (collect_next(&child_ret, &child)) {
         current_running--;
-        child_ret = handle_result(child_ret);
+        child_ret = handle_result(child_ret, (void*)child);
         if (child_ret < 0) {
           status = child_ret;
         }
@@ -180,28 +182,52 @@ class RGWReadRemoteMDLogInfoCR : public RGWShardCollectCR {
   RGWMetaSyncEnv *sync_env;
 
   const std::string& period;
-  int num_shards;
+  set<int> *shards;
+  set<int>::iterator iter;
+
   map<int, RGWMetadataLogInfo> *mdlog_info;
+
+  using StackRef = boost::intrusive_ptr<RGWCoroutinesStack>;
+  map<StackRef, int> stack_to_shard;
 
   int shard_id;
 #define READ_MDLOG_MAX_CONCURRENT 10
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
+    auto stack_iter = stack_to_shard.find(static_cast<RGWCoroutinesStack*>(data));
+    if (stack_iter == stack_to_shard.end()) {
+      ldout(cct, 0) << "ERROR: " << __func__ << "(). invalid RGWCoroutinesStack pointer. r=" << r << dendl;
+      return -EINVAL;
+    }
+
+    int res_shard_id = stack_iter->second;
+    ldout(cct, 20) << __func__ << "(). processed shard_id=" << res_shard_id << " r=" << r << dendl;
+
     if (r == -ENOENT) { // ENOENT is not a fatal error
+      shards->erase(shard_id);
       return 0;
     }
+
     if (r < 0) {
-      ldout(cct, 4) << "failed to fetch mdlog status: " << cpp_strerror(r) << dendl;
+      ldout(cct, 4) << __func__ << "(). failed to fetch mdlog status: "
+          << cpp_strerror(r) << " for shard_id=" << res_shard_id << dendl;
+      if (r == -EIO)
+        return 0;
     }
+
+    shards->erase(res_shard_id);
     return r;
   }
 public:
   RGWReadRemoteMDLogInfoCR(RGWMetaSyncEnv *_sync_env,
-                     const std::string& period, int _num_shards,
+                     const std::string& period, set<int>* _shards,
                      map<int, RGWMetadataLogInfo> *_mdlog_info) : RGWShardCollectCR(_sync_env->cct, READ_MDLOG_MAX_CONCURRENT),
                                                                  sync_env(_sync_env),
-                                                                 period(period), num_shards(_num_shards),
-                                                                 mdlog_info(_mdlog_info), shard_id(0) {}
+                                                                 period(period), shards(_shards),
+                                                                 mdlog_info(_mdlog_info), shard_id(-1) {
+    if (shards != nullptr)
+      iter = shards->begin();
+  }
   bool spawn_next() override;
 };
 
@@ -216,7 +242,7 @@ class RGWListRemoteMDLogCR : public RGWShardCollectCR {
   map<int, string>::iterator iter;
 #define READ_MDLOG_MAX_CONCURRENT 10
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }
@@ -244,10 +270,18 @@ int RGWRemoteMetaLog::read_log_info(const DoutPrefixProvider *dpp, rgw_mdlog_inf
   rgw_http_param_pair pairs[] = { { "type", "metadata" },
                                   { NULL, NULL } };
 
-  int ret = conn->get_json_resource(dpp, "/admin/log", pairs, null_yield, *log_info);
-  if (ret < 0) {
-    ldpp_dout(dpp, 0) << "ERROR: failed to fetch mdlog info" << dendl;
-    return ret;
+  static constexpr int MAX_RETRIES = 10;
+  for (int i = 0; i < MAX_RETRIES; i++) {
+    int ret = conn->get_json_resource(dpp, "/admin/log", pairs, null_yield, *log_info);
+    ldpp_dout(dpp, 20) << __func__ << "(). retry i= " << i << " ret=" << ret << dendl;
+    if (ret < 0) {
+      if (ret == -EIO && i < MAX_RETRIES - 1)
+        continue;
+      ldpp_dout(dpp, 0) << "ERROR: failed to fetch mdlog info" << dendl;
+      return ret;
+    } else {
+      break;
+    }
   }
 
   ldpp_dout(dpp, 20) << "remote mdlog, num_shards=" << log_info->num_shards << dendl;
@@ -267,7 +301,23 @@ int RGWRemoteMetaLog::read_master_log_shards_info(const DoutPrefixProvider *dpp,
     return ret;
   }
 
-  return run(dpp, new RGWReadRemoteMDLogInfoCR(&sync_env, master_period, log_info.num_shards, shards_info));
+  set<int> shards;
+  auto iter = shards.begin();
+  for (int i = 0; i < (int)log_info.num_shards; i++)
+    iter = shards.insert(iter, i);
+
+  static constexpr int MAX_RETRIES = 10;
+  for (int i = 0; i < MAX_RETRIES; i++) {
+    ret = run(dpp, new RGWReadRemoteMDLogInfoCR(&sync_env, master_period, &shards, shards_info));
+
+    ldpp_dout(dpp, 20) << __func__ << "(). RGWReadRemoteMDLogInfoCR ret=" << ret
+                       << " shards.size=" << shards.size() << " retry i=" << i << dendl;
+
+    if (shards.empty())
+      break;
+  }
+
+  return ret;
 }
 
 int RGWRemoteMetaLog::read_master_log_shards_next(const DoutPrefixProvider *dpp, const string& period, map<int, string> shard_markers, map<int, rgw_mdlog_shard_data> *result)
@@ -592,11 +642,13 @@ RGWCoroutine* create_list_remote_mdlog_shard_cr(RGWMetaSyncEnv *env,
 }
 
 bool RGWReadRemoteMDLogInfoCR::spawn_next() {
-  if (shard_id >= num_shards) {
+  if (shards == nullptr || iter == shards->end()) {
     return false;
   }
-  spawn(new RGWReadRemoteMDLogShardInfoCR(sync_env, period, shard_id, &(*mdlog_info)[shard_id]), false);
-  shard_id++;
+  shard_id = *iter;
+  RGWCoroutinesStack *stack = spawn(new RGWReadRemoteMDLogShardInfoCR(sync_env, period, shard_id, &(*mdlog_info)[shard_id]), false);
+  stack_to_shard[stack] = shard_id;
+  ++iter;
   return true;
 }
 
@@ -722,7 +774,7 @@ class RGWReadSyncStatusMarkersCR : public RGWShardCollectCR {
   int shard_id{0};
   map<uint32_t, rgw_meta_sync_marker>& markers;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }

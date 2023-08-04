@@ -94,7 +94,7 @@ class RGWReadDataSyncStatusMarkersCR : public RGWShardCollectCR {
   map<uint32_t, rgw_data_sync_marker>& markers;
   std::vector<RGWObjVersionTracker>& objvs;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }
@@ -141,7 +141,7 @@ class RGWReadDataSyncRecoveringShardsCR : public RGWShardCollectCR {
   string marker;
   std::vector<RGWRadosGetOmapKeysCR::ResultPtr>& omapkeys;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }
@@ -386,37 +386,62 @@ class RGWReadRemoteDataLogInfoCR : public RGWShardCollectCR {
   RGWDataSyncCtx *sc;
   RGWDataSyncEnv *sync_env;
 
-  int num_shards;
+  set<int> *shards;
+  set<int>::iterator iter;
+
   map<int, RGWDataChangesLogInfo> *datalog_info;
+
+  using StackRef = boost::intrusive_ptr<RGWCoroutinesStack>;
+  map<StackRef, int> stack_to_shard;
 
   int shard_id;
 #define READ_DATALOG_MAX_CONCURRENT 10
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
+    auto stack_iter = stack_to_shard.find(static_cast<RGWCoroutinesStack*>(data));
+    if (stack_iter == stack_to_shard.end()) {
+      ldout(cct, 0) << "ERROR: " << __func__ << "(). invalid RGWCoroutinesStack pointer. r=" << r << dendl;
+      return -EINVAL;
+    }
+
+    int res_shard_id = stack_iter->second;
+    ldout(cct, 20) << __func__ << "(). processed shard_id=" << res_shard_id << " r=" << r << dendl;
+
     if (r == -ENOENT) { // ENOENT is not a fatal error
+      shards->erase(shard_id);
       return 0;
     }
     if (r < 0) {
-      ldout(cct, 4) << "failed to fetch remote datalog info: "
-          << cpp_strerror(r) << dendl;
+      ldout(cct, 4) << __func__ << "(). failed to fetch remote datalog info: "
+          << cpp_strerror(r) << " for shard_id=" << res_shard_id << dendl;
+      if (r == -EIO)
+        return 0;
     }
+
+    shards->erase(res_shard_id);
     return r;
   }
 public:
   RGWReadRemoteDataLogInfoCR(RGWDataSyncCtx *_sc,
-                     int _num_shards,
+                     set<int>* _shards,
                      map<int, RGWDataChangesLogInfo> *_datalog_info) : RGWShardCollectCR(_sc->cct, READ_DATALOG_MAX_CONCURRENT),
-                                                                 sc(_sc), sync_env(_sc->env), num_shards(_num_shards),
-                                                                 datalog_info(_datalog_info), shard_id(0) {}
+                                                                 sc(_sc), sync_env(_sc->env), shards(_shards),
+                                                                 datalog_info(_datalog_info), shard_id(0) {
+    if (shards != nullptr)
+      iter = shards->begin();
+  }
   bool spawn_next() override;
 };
 
 bool RGWReadRemoteDataLogInfoCR::spawn_next() {
-  if (shard_id >= num_shards) {
+  if (shards == nullptr || iter == shards->end()) {
     return false;
   }
-  spawn(new RGWReadRemoteDataLogShardInfoCR(sc, shard_id, &(*datalog_info)[shard_id]), false);
-  shard_id++;
+  shard_id = *iter;
+  ldout(cct, 20) << __func__ << "(). shard_id=" << shard_id << dendl;
+  RGWCoroutinesStack *stack = spawn(new RGWReadRemoteDataLogShardInfoCR(sc, shard_id, &(*datalog_info)[shard_id]), false);
+  stack_to_shard[stack] = shard_id;
+  ++iter;
   return true;
 }
 
@@ -492,7 +517,7 @@ class RGWListRemoteDataLogCR : public RGWShardCollectCR {
   map<int, string>::iterator iter;
 #define READ_DATALOG_MAX_CONCURRENT 10
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }
@@ -662,10 +687,18 @@ int RGWRemoteDataLog::read_log_info(const DoutPrefixProvider *dpp, rgw_datalog_i
   rgw_http_param_pair pairs[] = { { "type", "data" },
                                   { NULL, NULL } };
 
-  int ret = sc.conn->get_json_resource(dpp, "/admin/log", pairs, null_yield, *log_info);
-  if (ret < 0) {
-    ldpp_dout(dpp, 0) << "ERROR: failed to fetch datalog info" << dendl;
-    return ret;
+  static constexpr int MAX_RETRIES = 10;
+  for (int i = 0; i < MAX_RETRIES; i++) {
+    int ret = sc.conn->get_json_resource(dpp, "/admin/log", pairs, null_yield, *log_info);
+    ldpp_dout(dpp, 20) << __func__ << "(). retry i= " << i << " ret=" << ret << dendl;
+    if (ret < 0) {
+      if (ret == -EIO && i < MAX_RETRIES - 1)
+        continue;
+      ldpp_dout(dpp, 0) << "ERROR: failed to fetch datalog info. ret=" << ret << dendl;
+      return ret;
+    } else {
+      break;
+    }
   }
 
   ldpp_dout(dpp, 20) << "remote datalog, num_shards=" << log_info->num_shards << dendl;
@@ -676,12 +709,29 @@ int RGWRemoteDataLog::read_log_info(const DoutPrefixProvider *dpp, rgw_datalog_i
 int RGWRemoteDataLog::read_source_log_shards_info(const DoutPrefixProvider *dpp, map<int, RGWDataChangesLogInfo> *shards_info)
 {
   rgw_datalog_info log_info;
+
   int ret = read_log_info(dpp, &log_info);
   if (ret < 0) {
     return ret;
   }
 
-  return run(dpp, new RGWReadRemoteDataLogInfoCR(&sc, log_info.num_shards, shards_info));
+  set<int> shards;
+  auto iter = shards.begin();
+  for (int i = 0; i < (int)log_info.num_shards; i++)
+    iter = shards.insert(iter, i);
+
+  static constexpr int MAX_RETRIES = 10;
+  for (int i = 0; i < MAX_RETRIES; i++) {
+    ret = run(dpp, new RGWReadRemoteDataLogInfoCR(&sc, &shards, shards_info));
+
+    ldpp_dout(dpp, 20) << __func__ << "(). RGWReadRemoteDataLogInfoCR ret=" << ret
+                       << " shards.size=" << shards.size() << " retry i=" << i << dendl;
+
+    if (shards.empty())
+      break;
+  }
+
+  return ret;
 }
 
 int RGWRemoteDataLog::read_source_log_shards_next(const DoutPrefixProvider *dpp, map<int, string> shard_markers, map<int, rgw_datalog_shard_data> *result)
@@ -3544,7 +3594,7 @@ class CheckAllBucketShardStatusIsIncremental : public RGWShardCollectCR {
   }
 
  private:
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r < 0) {
       ldout(cct, 4) << "failed to read bucket shard status: "
           << cpp_strerror(r) << dendl;
@@ -3597,7 +3647,7 @@ class InitBucketShardStatusCollectCR : public RGWShardCollectCR {
   const int num_shards;
   int shard = 0;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r < 0) {
       ldout(cct, 4) << "failed to init bucket shard status: "
           << cpp_strerror(r) << dendl;
@@ -3666,7 +3716,7 @@ class RemoveBucketShardStatusCollectCR : public RGWShardCollectCR {
   const int num_shards;
   int shard = 0;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r < 0) {
       ldout(cct, 4) << "failed to remove bucket shard status object: "
           << cpp_strerror(r) << dendl;
@@ -6357,7 +6407,7 @@ public:
     return true;
   }
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r < 0) {
       ldpp_dout(sc.env->dpp, 4) << "ERROR: Error syncing shard: "
 				<< cpp_strerror(r) << dendl;
@@ -6599,7 +6649,7 @@ class RGWCollectBucketSyncStatusCR : public RGWShardCollectCR {
   using Vector = std::vector<rgw_bucket_shard_sync_info>;
   Vector::iterator i, end;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }

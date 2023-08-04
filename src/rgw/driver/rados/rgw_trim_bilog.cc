@@ -367,7 +367,7 @@ class BucketTrimShardCollectCR : public RGWShardCollectCR {
   const std::vector<std::string>& markers; //< shard markers to trim
   size_t i{0}; //< index of current shard marker
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }
@@ -417,7 +417,7 @@ class BucketCleanIndexCollectCR : public RGWShardCollectCR {
   uint32_t shard = 0;
   const uint32_t num_shards = rgw::num_shards(index);
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }
@@ -819,7 +819,7 @@ class BucketTrimInstanceCollectCR : public RGWShardCollectCR {
   std::vector<std::string>::const_iterator end;
   const DoutPrefixProvider *dpp;
 
-  int handle_result(int r) override {
+  int handle_result(int r, void *data = nullptr) override {
     if (r == -ENOENT) { // ENOENT is not a fatal error
       return 0;
     }

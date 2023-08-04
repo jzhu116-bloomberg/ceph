@@ -21,6 +21,12 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct, rgw::sal::Driver* driver,
     api_name(_api_name),
     host_style(_host_style)
 {
+  endpoints_status.reserve(remote_endpoints.size());
+  std::for_each(remote_endpoints.begin(), remote_endpoints.end(),
+                [this](const std::string& url) {
+                  this->endpoints_status.emplace(url, conn_status{true, ceph::real_clock::now()});
+                });
+
   if (driver) {
     key = driver->get_zone()->get_system_key();
     self_zone_group = driver->get_zone()->get_zonegroup().get_id();
@@ -42,11 +48,17 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct,
     api_name(_api_name),
     host_style(_host_style)
 {
+  endpoints_status.reserve(remote_endpoints.size());
+  std::for_each(remote_endpoints.begin(), remote_endpoints.end(),
+                [this](const std::string& url) {
+                  this->endpoints_status.emplace(url, conn_status{true, ceph::real_clock::now()});
+                });
 }
 
 RGWRESTConn::RGWRESTConn(RGWRESTConn&& other)
   : cct(other.cct),
     endpoints(std::move(other.endpoints)),
+    endpoints_status(std::move(other.endpoints_status)),
     key(std::move(other.key)),
     self_zone_group(std::move(other.self_zone_group)),
     remote_id(std::move(other.remote_id)),
@@ -58,6 +70,7 @@ RGWRESTConn& RGWRESTConn::operator=(RGWRESTConn&& other)
 {
   cct = other.cct;
   endpoints = std::move(other.endpoints);
+  endpoints_status = std::move(other.endpoints_status);
   key = std::move(other.key);
   self_zone_group = std::move(other.self_zone_group);
   remote_id = std::move(other.remote_id);
@@ -72,8 +85,45 @@ int RGWRESTConn::get_url(string& endpoint)
     return -EIO;
   }
 
-  int i = ++counter;
-  endpoint = endpoints[i % endpoints.size()];
+  size_t num = 0;
+  while (num < endpoints.size()) {
+    int i = ++counter;
+    endpoint = endpoints[i % endpoints.size()];
+
+    if (endpoints_status.find(endpoint) == endpoints_status.end()) {
+      ldout(cct, 1) << "WARNING: missing status for endpoint " << endpoint << dendl;
+      num++;
+      continue;
+    }
+
+    auto& endpoint_status = endpoints_status[endpoint];
+
+    if (endpoint_status.connectable)
+      break;
+
+    auto diff = ceph::to_seconds<double>(ceph::real_clock::now() - endpoint_status.last_status_update);
+
+    ldout(cct, 20) << "endpoint url=" << endpoint
+                  << " connectable=" << (endpoint_status.connectable ? "true" : "false")
+                  << " last_status_update=" << endpoint_status.last_status_update
+                  << " diff=" << diff << dendl;
+
+    static constexpr uint32_t CONN_STATUS_EXPIRE_SECS = 2;
+    if (diff >= CONN_STATUS_EXPIRE_SECS) {
+      endpoint_status.connectable = true;
+      endpoint_status.last_status_update = ceph::real_clock::now();
+      ldout(cct, 1) << "unconnectable endpoint " << endpoint << " status expired, and marked connectable" << dendl;
+      break;
+    }
+    num++;
+  };
+
+  if (num == endpoints.size()) {
+    ldout(cct, 5) << "ERROR: no valid endpoint" << dendl;
+    return -EIO;
+  }
+  ldout(cct, 20) << "get_url picked endpoint=" << endpoint
+                 << " conn=" << (void*)this << dendl;
 
   return 0;
 }
@@ -83,6 +133,22 @@ string RGWRESTConn::get_url()
   string endpoint;
   get_url(endpoint);
   return endpoint;
+}
+
+void RGWRESTConn::set_url_unconnectable(const std::string& endpoint)
+{
+  if (endpoint.empty()) {
+    ldout(cct, 0) << "ERROR: not a valid endpoint" << dendl;
+    return;
+  }
+
+  auto& endpoint_status = endpoints_status[endpoint];
+  endpoint_status.connectable = false;
+  endpoint_status.last_status_update = ceph::real_clock::now();
+
+  ldout(cct, 20) << "set endpoint unconnectable. url=" << endpoint
+                << " last_status_update=" << endpoint_status.last_status_update
+                << " conn=" << (void*)this << dendl;
 }
 
 void RGWRESTConn::populate_params(param_vec_t& params, const rgw_user *uid, const string& zonegroup)
@@ -358,10 +424,19 @@ int RGWRESTConn::get_resource(const DoutPrefixProvider *dpp,
   ret = req.send_request(dpp, &key, headers, resource, mgr, send_data);
   if (ret < 0) {
     ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
+    if (ret == -EIO)
+      set_url_unconnectable(url);
     return ret;
   }
 
-  return req.complete_request(y);
+  ret = req.complete_request(y);
+  if (ret < 0) {
+    ldpp_dout(dpp, 5) << __func__ << ": complete_request() returned ret=" << ret << dendl;
+    if (ret == -EIO)
+      set_url_unconnectable(url);
+  }
+
+  return ret;
 }
 
 int RGWRESTConn::send_resource(const DoutPrefixProvider *dpp, const std::string& method,
@@ -394,12 +469,16 @@ int RGWRESTConn::send_resource(const DoutPrefixProvider *dpp, const std::string&
   ret = req.send_request(dpp, &key, headers, resource, mgr, send_data);
   if (ret < 0) {
     ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
+    if (ret == -EIO)
+      set_url_unconnectable(url);
     return ret;
   }
 
   ret = req.complete_request(y);
   if (ret < 0) {
     ldpp_dout(dpp, 5) << __func__ << ": complete_request() resource=" << resource << " returned ret=" << ret << dendl;
+    if (ret == -EIO)
+      set_url_unconnectable(url);
   }
 
   return ret;
@@ -410,9 +489,9 @@ RGWRESTReadResource::RGWRESTReadResource(RGWRESTConn *_conn,
 		                         const rgw_http_param_pair *pp,
 					 param_vec_t *extra_headers,
                                          RGWHTTPManager *_mgr)
-  : cct(_conn->get_ctx()), conn(_conn), resource(_resource),
-    params(make_param_list(pp)), cb(bl), mgr(_mgr),
-    req(cct, conn->get_url(), &cb, NULL, NULL, _conn->get_api_name())
+  : cct(_conn->get_ctx()), conn(_conn), url(conn->get_url()), resource(_resource),
+    params(make_param_list(pp)), cb(bl), req_ret(0), mgr(_mgr),
+    req(cct, url, &cb, NULL, NULL, _conn->get_api_name())
 {
   init_common(extra_headers);
 }
@@ -422,10 +501,17 @@ RGWRESTReadResource::RGWRESTReadResource(RGWRESTConn *_conn,
 					 param_vec_t& _params,
 					 param_vec_t *extra_headers,
                                          RGWHTTPManager *_mgr)
-  : cct(_conn->get_ctx()), conn(_conn), resource(_resource), params(_params),
-    cb(bl), mgr(_mgr), req(cct, conn->get_url(), &cb, NULL, NULL, _conn->get_api_name())
+  : cct(_conn->get_ctx()), conn(_conn), url(conn->get_url()), resource(_resource), params(_params),
+    cb(bl), req_ret(0), mgr(_mgr), req(cct, url, &cb, NULL, NULL, _conn->get_api_name())
 {
   init_common(extra_headers);
+}
+
+RGWRESTReadResource::~RGWRESTReadResource()
+{
+  if (req_ret == -EIO) {
+    conn->set_url_unconnectable(url);
+  }
 }
 
 void RGWRESTReadResource::init_common(param_vec_t *extra_headers)
@@ -441,21 +527,26 @@ void RGWRESTReadResource::init_common(param_vec_t *extra_headers)
 
 int RGWRESTReadResource::read(const DoutPrefixProvider *dpp, optional_yield y)
 {
-  int ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
-  if (ret < 0) {
-    ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
-    return ret;
+  req_ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
+  if (req_ret < 0) {
+    ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << req_ret << dendl;
+    return req_ret;
   }
 
-  return req.complete_request(y);
+  req_ret = req.complete_request(y);
+  if (req_ret < 0) {
+    ldpp_dout(dpp, 5) << __func__ << ": complete_request() returned ret=" << req_ret << dendl;
+  }
+
+  return req_ret;
 }
 
 int RGWRESTReadResource::aio_read(const DoutPrefixProvider *dpp)
 {
-  int ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
-  if (ret < 0) {
-    ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
-    return ret;
+  req_ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
+  if (req_ret < 0) {
+    ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << req_ret << dendl;
+    return req_ret;
   }
 
   return 0;
@@ -467,9 +558,9 @@ RGWRESTSendResource::RGWRESTSendResource(RGWRESTConn *_conn,
 		                         const rgw_http_param_pair *pp,
 					 param_vec_t *extra_headers,
                                          RGWHTTPManager *_mgr)
-  : cct(_conn->get_ctx()), conn(_conn), method(_method), resource(_resource),
-    params(make_param_list(pp)), cb(bl), mgr(_mgr),
-    req(cct, method.c_str(), conn->get_url(), &cb, NULL, NULL, _conn->get_api_name(), _conn->get_host_style())
+  : cct(_conn->get_ctx()), conn(_conn), url(conn->get_url()), method(_method), resource(_resource),
+    params(make_param_list(pp)), cb(bl), req_ret(0), mgr(_mgr),
+    req(cct, method.c_str(), url, &cb, NULL, NULL, _conn->get_api_name(), _conn->get_host_style())
 {
   init_common(extra_headers);
 }
@@ -480,10 +571,18 @@ RGWRESTSendResource::RGWRESTSendResource(RGWRESTConn *_conn,
 					 param_vec_t& params,
 					 param_vec_t *extra_headers,
                                          RGWHTTPManager *_mgr)
-  : cct(_conn->get_ctx()), conn(_conn), method(_method), resource(_resource), params(params),
-    cb(bl), mgr(_mgr), req(cct, method.c_str(), conn->get_url(), &cb, NULL, NULL, _conn->get_api_name(), _conn->get_host_style())
+  : cct(_conn->get_ctx()), conn(_conn), url(conn->get_url()), method(_method), resource(_resource),
+    params(params), cb(bl), req_ret(0), mgr(_mgr),
+    req(cct, method.c_str(), url, &cb, NULL, NULL, _conn->get_api_name(), _conn->get_host_style())
 {
   init_common(extra_headers);
+}
+
+RGWRESTSendResource::~RGWRESTSendResource()
+{
+  if (req_ret == -EIO) {
+    conn->set_url_unconnectable(url);
+  }
 }
 
 void RGWRESTSendResource::init_common(param_vec_t *extra_headers)
@@ -502,13 +601,18 @@ int RGWRESTSendResource::send(const DoutPrefixProvider *dpp, bufferlist& outbl, 
   req.set_send_length(outbl.length());
   req.set_outbl(outbl);
 
-  int ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
-  if (ret < 0) {
-    ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
-    return ret;
+  req_ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
+  if (req_ret < 0) {
+    ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << req_ret << dendl;
+    return req_ret;
   }
 
-  return req.complete_request(y);
+  req_ret = req.complete_request(y);
+  if (req_ret < 0) {
+    ldpp_dout(dpp, 5) << __func__ << ": complete_request() returned ret=" << req_ret << dendl;
+  }
+
+  return req_ret;
 }
 
 int RGWRESTSendResource::aio_send(const DoutPrefixProvider *dpp, bufferlist& outbl)
@@ -516,10 +620,10 @@ int RGWRESTSendResource::aio_send(const DoutPrefixProvider *dpp, bufferlist& out
   req.set_send_length(outbl.length());
   req.set_outbl(outbl);
 
-  int ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
-  if (ret < 0) {
-    ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
-    return ret;
+  req_ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
+  if (req_ret < 0) {
+    ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << req_ret << dendl;
+    return req_ret;
   }
 
   return 0;
