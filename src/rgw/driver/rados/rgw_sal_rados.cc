@@ -3511,7 +3511,8 @@ std::unique_ptr<Writer> RadosMultipartUpload::get_writer(
   return std::make_unique<RadosMultipartWriter>(dpp, y, get_upload_id(),
 				 bucket_info, obj_ctx,
 				 obj->get_obj(), store, std::move(aio), owner,
-				 ptail_placement_rule, part_num, part_num_str, obj->get_trace());
+				 ptail_placement_rule, part_num, part_num_str,
+				 obj->get_trace(), this);
 }
 
 MPRadosSerializer::MPRadosSerializer(const DoutPrefixProvider *dpp, RadosStore* store, RadosObject* obj, const std::string& lock_name) :

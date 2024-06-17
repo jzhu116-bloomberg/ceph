@@ -567,6 +567,37 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
     return r;
   }
 
+  /* take a cls lock on meta_obj to prevent writing to meta object deleted by completion */
+  auto mp_meta_obj = upload->get_meta_obj();
+  if (mp_meta_obj == nullptr) {
+    ldpp_dout(dpp, 5) << "the meta object dosen't exist: upload_id" << upload_id  << dendl;
+    return -ERR_NO_SUCH_UPLOAD;
+  }
+  mp_meta_obj->set_in_extra_data(true);
+  mp_meta_obj->set_hash_source(target_obj.get_oid());
+
+  int max_lock_secs_mp =
+    store->ctx()->_conf.get_val<int64_t>("rgw_mp_lock_max_time");
+  utime_t dur(max_lock_secs_mp, 0);
+
+  auto serializer = mp_meta_obj->get_serializer(dpp, "RGWCompleteMultipart");
+
+  /* retry in case another part upload holds the lock */
+  static constexpr int NUM_TRY_LOCK_RETRIES = 3;
+  for (int i = 0; i < NUM_TRY_LOCK_RETRIES; i++) {
+    r = serializer->try_lock(dpp, dur, rctx.y);
+    if (r < 0 && r != -ENOENT) {
+      ldpp_dout(dpp, 20) << "failed to acquire lock. ret = " << r << ", retry = " << i << dendl;
+      continue;
+    }
+    break;
+  }
+  if (r < 0) {
+    ldpp_dout(dpp, 5) << "failed to acquire lock. r = " << r << dendl;
+    r = -ERR_NO_SUCH_UPLOAD;
+    return r;
+  }
+
   librados::ObjectWriteOperation op;
   cls_rgw_mp_upload_part_info_update(op, p, info);
   r = rgw_rados_operate(rctx.dpp, meta_obj_ref.ioctx, meta_obj_ref.obj.oid, &op, rctx.y);
@@ -585,6 +616,8 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
     op.omap_set(m);
     r = rgw_rados_operate(rctx.dpp, meta_obj_ref.ioctx, meta_obj_ref.obj.oid, &op, rctx.y);
   }
+  serializer->unlock();
+
   if (r < 0) {
     return r == -ENOENT ? -ERR_NO_SUCH_UPLOAD : r;
   }

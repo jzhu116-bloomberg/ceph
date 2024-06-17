@@ -1050,14 +1050,15 @@ public:
 		       RadosStore* _store, std::unique_ptr<Aio> _aio,
 		       const ACLOwner& owner,
 		       const rgw_placement_rule *ptail_placement_rule,
-		       uint64_t part_num, const std::string& part_num_str, jspan_context& trace) :
+		       uint64_t part_num, const std::string& part_num_str,
+		       jspan_context& trace, rgw::sal::MultipartUpload* _upload) :
 			StoreWriter(dpp, y),
 			store(_store),
 			aio(std::move(_aio)),
 			obj_ctx(obj_ctx),
 			processor(&*aio, store->getRados(), bucket_info,
 				  ptail_placement_rule, owner, obj_ctx,
-				  obj, upload_id,
+				  obj, upload_id, _upload,
 				  part_num, part_num_str, dpp, y, trace)
   {}
   ~RadosMultipartWriter() = default;

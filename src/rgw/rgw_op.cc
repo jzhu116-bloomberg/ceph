@@ -4198,8 +4198,8 @@ void RGWPutObj::execute(optional_yield y)
 
   s->object->set_trace(s->trace->GetContext());
 
+  std::unique_ptr<rgw::sal::MultipartUpload> upload;
   if (multipart) {
-    std::unique_ptr<rgw::sal::MultipartUpload> upload;
     upload = s->bucket->get_multipart_upload(s->object->get_name(),
 					 multipart_upload_id);
     op_ret = upload->get_info(this, s->yield, &pdest_placement);
@@ -6355,7 +6355,18 @@ void RGWCompleteMultipart::execute(optional_yield y)
   utime_t dur(max_lock_secs_mp, 0);
 
   serializer = meta_obj->get_serializer(this, "RGWCompleteMultipart");
-  op_ret = serializer->try_lock(this, dur, y);
+
+  /* retry in case a part upload holds the lock */
+  static constexpr int NUM_TRY_LOCK_RETRIES = 3;
+  for (int i = 0; i < NUM_TRY_LOCK_RETRIES; i++) {
+    op_ret = serializer->try_lock(this, dur, y);
+    if (op_ret < 0 && op_ret != -ENOENT) {
+      ldpp_dout(this, 20) << "failed to acquire lock. ret = " << op_ret << ", retry = " << i << dendl;
+      continue;
+    }
+    break;
+  }
+
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "failed to acquire lock" << dendl;
     if (op_ret == -ENOENT && check_previously_completed(parts)) {

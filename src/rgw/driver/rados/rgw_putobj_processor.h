@@ -209,6 +209,7 @@ class AtomicObjectProcessor : public ManifestObjectProcessor {
 class MultipartObjectProcessor : public ManifestObjectProcessor {
   const rgw_obj target_obj; // target multipart object
   const std::string upload_id;
+  rgw::sal::MultipartUpload* upload;
   const int part_num;
   const std::string part_num_str;
   RGWMPObj mp;
@@ -224,12 +225,14 @@ class MultipartObjectProcessor : public ManifestObjectProcessor {
                            const rgw_placement_rule *ptail_placement_rule,
                            const ACLOwner& owner, RGWObjectCtx& obj_ctx,
                            const rgw_obj& _head_obj,
-                           const std::string& upload_id, uint64_t part_num,
+                           const std::string& upload_id,
+                           rgw::sal::MultipartUpload* _upload,
+                           uint64_t part_num,
                            const std::string& part_num_str,
                            const DoutPrefixProvider *dpp, optional_yield y, jspan_context& trace)
     : ManifestObjectProcessor(aio, store, bucket_info, ptail_placement_rule,
                               owner, obj_ctx, _head_obj, dpp, y, trace),
-      target_obj(head_obj), upload_id(upload_id),
+      target_obj(head_obj), upload_id(upload_id), upload(_upload),
       part_num(part_num), part_num_str(part_num_str),
       mp(head_obj.key.name, upload_id)
   {}
