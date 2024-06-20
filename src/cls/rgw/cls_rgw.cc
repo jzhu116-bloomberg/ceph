@@ -4369,6 +4369,14 @@ static int rgw_cls_lc_get_head(cls_method_context_t hctx, bufferlist *in,  buffe
 static int rgw_mp_upload_part_info_update(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
   CLS_LOG(10, "entered %s", __func__);
+
+  std::uint64_t size;
+  int rc = cls_cxx_stat2(hctx, &size, nullptr);
+  if (rc < 0) {
+    CLS_LOG(5, "ERROR: %s: cls_cxx_stat2() on obj returned %d", __func__, rc);
+    return rc;
+  }
+
   cls_rgw_mp_upload_part_info_update_op op;
   auto in_iter = in->cbegin();
   try {

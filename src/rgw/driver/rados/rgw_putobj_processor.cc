@@ -22,6 +22,8 @@
 #include "services/svc_zone.h"
 #include "rgw_sal_rados.h"
 
+#include "cls/version/cls_version_client.h"
+
 #define dout_subsys ceph_subsys_rgw
 
 using namespace std;
@@ -567,6 +569,16 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
     return r;
   }
 
+#if 1 // hack to reproduce the issue
+  static int s_count = 0;
+  s_count++;
+  if (s_count % 2 != 0) {
+    ldpp_dout(dpp, 0) << "MultipartObjectProcessor::complete: Sleep a bit. s_count= " << s_count << dendl;
+    sleep(30);
+  }
+#endif
+
+#if 0
   /* take a cls lock on meta_obj to prevent writing to meta object deleted by completion */
   auto mp_meta_obj = upload->get_meta_obj();
   if (mp_meta_obj == nullptr) {
@@ -597,9 +609,10 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
     r = -ERR_NO_SUCH_UPLOAD;
     return r;
   }
-
+#endif
   librados::ObjectWriteOperation op;
   cls_rgw_mp_upload_part_info_update(op, p, info);
+  cls_version_inc(op);
   r = rgw_rados_operate(rctx.dpp, meta_obj_ref.ioctx, meta_obj_ref.obj.oid, &op, rctx.y);
   ldpp_dout(rctx.dpp, 20) << "Update meta: " << meta_obj_ref.obj.oid << " part " << p << " prefix " << info.manifest.get_prefix() << " return " << r << dendl;
 
@@ -614,9 +627,10 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
     op = librados::ObjectWriteOperation{};
     op.assert_exists(); // detect races with abort
     op.omap_set(m);
+    cls_version_inc(op);
     r = rgw_rados_operate(rctx.dpp, meta_obj_ref.ioctx, meta_obj_ref.obj.oid, &op, rctx.y);
   }
-  serializer->unlock();
+  //serializer->unlock();
 
   if (r < 0) {
     return r == -ENOENT ? -ERR_NO_SUCH_UPLOAD : r;

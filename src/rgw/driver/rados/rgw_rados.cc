@@ -5840,6 +5840,12 @@ int RGWRados::Object::Delete::delete_obj(optional_yield y, const DoutPrefixProvi
 
   store->remove_rgw_head_obj(op);
 
+  if (params.check_objv != nullptr) {
+    ldpp_dout(dpp, 0) << "#####: params.check_objv" << *params.check_objv << dendl;
+    //state->objv_tracker.prepare_op_for_write(&op);
+    cls_version_check(op, *params.check_objv, VER_COND_EQ);
+  }
+
   auto& ioctx = ref.ioctx;
   r = rgw_rados_operate(dpp, ioctx, ref.obj.oid, &op, y);
 
@@ -6032,8 +6038,9 @@ int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *oc
   int r = -ENOENT;
 
   if (!assume_noent) {
-    r = RGWRados::raw_obj_stat(dpp, raw_obj, &s->size, &s->mtime, &s->epoch, &s->attrset, (s->prefetch_data ? &s->data : NULL), NULL, y);
+    r = RGWRados::raw_obj_stat(dpp, raw_obj, &s->size, &s->mtime, &s->epoch, &s->attrset, (s->prefetch_data ? &s->data : NULL), &s->objv_tracker, y);
   }
+  ldpp_dout(dpp, 0) << "#####: got s->objv_tracker = " << s->objv_tracker << dendl;
 
   if (r == -ENOENT) {
     s->exists = false;
@@ -6730,11 +6737,13 @@ int RGWRados::Object::Read::prepare(optional_yield y, const DoutPrefixProvider *
     part_prefetch = std::exchange(sm->state.prefetch_data, false);
   }
 
+  ldpp_dout(dpp, 0) << "#####: calling get_state" << dendl;
   RGWObjState *astate;
   RGWObjManifest *manifest = nullptr;
   int r = source->get_state(dpp, &astate, &manifest, true, y);
   if (r < 0)
     return r;
+  ldpp_dout(dpp, 0) << "#####: called get_state" << dendl;
 
   if (!astate->exists) {
     return -ENOENT;
@@ -6773,6 +6782,7 @@ int RGWRados::Object::Read::prepare(optional_yield y, const DoutPrefixProvider *
   state.cur_pool = state.head_obj.pool;
   state.cur_ioctx = &state.io_ctxs[state.cur_pool];
 
+  ldpp_dout(dpp, 0) << "#####: calling get_obj_head_ioctx" << dendl;
   r = store->get_obj_head_ioctx(dpp, bucket_info, state.obj, state.cur_ioctx);
   if (r < 0) {
     return r;
@@ -8657,8 +8667,15 @@ int RGWRados::raw_obj_stat(const DoutPrefixProvider *dpp,
   if (first_chunk) {
     op.read(0, cct->_conf->rgw_max_chunk_size, first_chunk, NULL);
   }
+
+  ldpp_dout(dpp, 0) << "#####: calling rgw_rados_operate to raw_obj_stat" << dendl;
+  //obj_version read_version;
+  //cls_version_read(op, &read_version);
+
   bufferlist outbl;
   r = rgw_rados_operate(dpp, ref.ioctx, ref.obj.oid, &op, &outbl, y);
+  //ldpp_dout(dpp, 0) << "#####: called rgw_rados_operate. read_version: " << read_version << dendl;
+  ldpp_dout(dpp, 0) << "#####: called rgw_rados_operate. objv_tracker: " << *objv_tracker << dendl;
 
   if (epoch) {
     *epoch = ref.ioctx.get_last_version();

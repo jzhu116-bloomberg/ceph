@@ -6356,6 +6356,8 @@ void RGWCompleteMultipart::execute(optional_yield y)
 
   serializer = meta_obj->get_serializer(this, "RGWCompleteMultipart");
 
+  op_ret = serializer->try_lock(this, dur, y);
+#if 0  
   /* retry in case a part upload holds the lock */
   static constexpr int NUM_TRY_LOCK_RETRIES = 3;
   for (int i = 0; i < NUM_TRY_LOCK_RETRIES; i++) {
@@ -6366,6 +6368,7 @@ void RGWCompleteMultipart::execute(optional_yield y)
     }
     break;
   }
+#endif
 
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "failed to acquire lock" << dendl;
@@ -6379,12 +6382,14 @@ void RGWCompleteMultipart::execute(optional_yield y)
     return;
   }
 
+  ldpp_dout(this, 0) << "#####: calling get_obj_attr" << dendl;
   op_ret = meta_obj->get_obj_attrs(s->yield, this);
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "ERROR: failed to get obj attrs, obj=" << meta_obj
 		     << " ret=" << op_ret << dendl;
     return;
   }
+
   s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, upload_id);
   jspan_context trace_ctx(false, false);
   extract_span_context(meta_obj->get_attrs(), trace_ctx);
@@ -6408,12 +6413,47 @@ void RGWCompleteMultipart::execute(optional_yield y)
     return;
   }
 
-  op_ret = upload->complete(this, y, s->cct, parts->parts, remove_objs, accounted_size, compressed, cs_info, ofs, s->req_id, s->owner, olh_epoch, s->object.get());
-  if (op_ret < 0) {
-    ldpp_dout(this, 0) << "ERROR: upload complete failed ret=" << op_ret << dendl;
-    return;
+  while (true) {
+    RGWObjVersionTracker objv_tracker = meta_obj->get_version_tracker();
+    ldpp_dout(this, 0) << "#####: objv_tracker for meta_obj = " << objv_tracker << dendl;
+
+    ldpp_dout(this, 0) << "#####: calling complete" << dendl;
+    op_ret = upload->complete(this, y, s->cct, parts->parts, remove_objs, accounted_size, compressed, cs_info, ofs, s->req_id, s->owner, olh_epoch, s->object.get());
+    if (op_ret < 0) {
+      ldpp_dout(this, 0) << "ERROR: upload complete failed ret=" << op_ret << dendl;
+      return;
+    }
+  
+    // remove the upload meta object ; the meta object is not versioned
+    // when the bucket is, as that would add an unneeded delete marker
+    // ?????????????
+    ldpp_dout(this, 0) << "Before delete meta_obj: Sleep a bit." << dendl;
+    sleep(30);
+    int ret = meta_obj->delete_object(this, y, rgw::sal::FLAG_PREVENT_VERSIONING, &objv_tracker);
+    //ret = 0;
+    if (ret != -ECANCELED) {
+      if (ret >= 0) {
+        /* serializer's exclusive lock is released */
+        serializer->clear_locked();
+      } else {
+        ldpp_dout(this, 4) << "WARNING: failed to remove object " << meta_obj << ", ret: " << ret << dendl;
+      }
+      break;
+    }
+  
+    ldpp_dout(this, 0) << "#####: meta_obj objv_tracker before clearing: " << meta_obj->get_version_tracker() << dendl;
+    meta_obj->get_version_tracker().clear();
+    ldpp_dout(this, 0) << "#####: meta_obj objv_tracker after clearing: " << meta_obj->get_version_tracker() << dendl;
+
+    ldpp_dout(this, 0) << "#####: calling get_obj_attr" << dendl;
+    ret = meta_obj->get_obj_attrs(s->yield, this);
+    if (ret < 0) {
+      ldpp_dout(this, 0) << "ERROR: failed to get obj attrs, obj=" << meta_obj
+			 << " ret=" << ret << dendl;
+    }
   }
 
+  ldpp_dout(this, 0) << "#####: calling get_attrs" << dendl;
   const ceph::real_time upload_time = upload->get_mtime();
   etag = s->object->get_attrs()[RGW_ATTR_ETAG].to_str();
 
@@ -6424,15 +6464,8 @@ void RGWCompleteMultipart::execute(optional_yield y)
     // too late to rollback operation, hence op_ret is not set here
   }
 
-  // remove the upload meta object ; the meta object is not versioned
-  // when the bucket is, as that would add an unneeded delete marker
-  ret = meta_obj->delete_object(this, y, rgw::sal::FLAG_PREVENT_VERSIONING);
-  if (ret >= 0) {
-    /* serializer's exclusive lock is released */
-    serializer->clear_locked();
-  } else {
-    ldpp_dout(this, 4) << "WARNING: failed to remove object " << meta_obj << ", ret: " << ret << dendl;
-  }
+  /* serializer's exclusive lock is released */
+  serializer->clear_locked();
 
 } // RGWCompleteMultipart::execute
 
